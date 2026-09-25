@@ -30,6 +30,12 @@
                           并报告 IEND 之后附加字节长度与 SHA-256；截断、越界长度、
                           缺少/重复 IEND、CRC 错误均给出偏移与明确结论，能解码不等于
                           结构完整。全程内存，不落盘、不建任务、不影响隐私导出
+  POST /api/horizon-correct  上传 PNG + 同一水平参照线两端点（原图像素坐标）
+                          -> 求反向旋转角并绕图心旋转，按原图矩形边界精确求解
+                          最大居中、轴对齐且不含旋转填充的裁剪区（原图自身透明
+                          像素不视为填充空白），哨兵覆盖自检通过后返回角度、
+                          裁剪范围与可下载 PNG；两点重合或超出图像范围明确拒绝。
+                          全程内存，不落盘、不建任务，结果可直接送入嵌入表单
   GET  /api/jobs/{id}/{kind}  任务文件下载（original/watermarked/target/marked）
   GET  /api/jobs/{id}/detections/{det_id}/{kind}  某次检测的输入快照 / 标注图
   POST /api/jobs/{id}/reports   选择一次或多次检测 -> 可验证 JSON 报告并追加归档
@@ -53,7 +59,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from . import archive, autostrength, dctwm as wm
-from . import exifcheck, matrix, orientation, pngaudit, privacy_export, provenance
+from . import exifcheck, horizon, matrix, orientation, pngaudit, privacy_export, provenance
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -63,7 +69,7 @@ MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 MAX_DIM = 4096
 ALLOWED_KINDS = {"original", "watermarked", "target", "marked"}
 
-app = FastAPI(title="抗裁切水印实验台", version="1.7.0")
+app = FastAPI(title="抗裁切水印实验台", version="1.8.0")
 
 
 # ---------------------------------------------------------------- 任务存储
@@ -673,6 +679,43 @@ async def png_audit(image: UploadFile = File(...)):
         **result,
         "stored": False,
     })
+
+
+@app.post("/api/horizon-correct")
+async def horizon_correct(
+    image: UploadFile = File(...),
+    x1: str = Form(...),
+    y1: str = Form(...),
+    x2: str = Form(...),
+    y2: str = Form(...),
+):
+    """图片水平线校正（全内存，不落盘、不建任务）。
+
+    用户在同一条水平参照线上点选两个端点（原图像素坐标），服务端求
+    反向旋转角并绕图心旋转，再按原图矩形边界精确求解最大居中、轴对齐
+    且不含旋转填充空白的裁剪区（裁剪完全由几何决定，原图自身透明像素
+    不视为填充空白），经哨兵覆盖自检后返回角度、裁剪范围与可下载 PNG。
+
+    两点重合（间距 < 1px）或任一点超出图像范围返回 400 并明确说明；
+    非 PNG / 无法解码 / 尺寸超限同样 400；超过 16MB 返回 413；
+    自检未通过返回 500 且不提供下载。校正结果可直接送入 /api/embed。
+    """
+    data = await image.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="图片不能超过 16MB。")
+    if not data:
+        raise HTTPException(status_code=400, detail="上传内容为空。")
+    try:
+        result = horizon.correct_horizon(data, x1, y1, x2, y2)
+    except horizon.HorizonError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except horizon.HorizonRecheckError as e:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"水平线校正自检未通过，已拒绝提供下载。{e}",
+                     "stored": False},
+        )
+    return JSONResponse({"filename": image.filename, **result})
 
 
 @app.get("/api/jobs/{job_id}/{kind}")

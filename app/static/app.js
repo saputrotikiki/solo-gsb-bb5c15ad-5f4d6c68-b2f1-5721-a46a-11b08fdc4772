@@ -1272,6 +1272,256 @@ function formatBytes(n) {
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
+/* ---------------- 图片水平线校正（两点选线 → 反向旋转 → 最大无填充裁剪） ---------------- */
+
+const horizon = {
+  file: null,        // 当前上传的 PNG 文件
+  img: null,         // 已解码的 Image 对象（用于画布预览）
+  points: [],        // 已点选的参照线端点（原图像素坐标，最多 2 个）
+  result: null,      // 最近一次校正结果（含 download.data_url）
+};
+
+$("#horizon-file").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  const status = $("#horizon-status");
+  resetHorizon();
+  if (!f) return;
+  if (!/^image\/png$/i.test(f.type)) {
+    e.target.value = "";
+    return fail(status, "水平线校正仅支持 PNG 图片。");
+  }
+  horizon.file = f;
+  const url = URL.createObjectURL(f);
+  const img = new Image();
+  img.onload = () => {
+    horizon.img = img;
+    $("#horizon-pick").classList.remove("hidden");
+    drawHorizonCanvas();
+    URL.revokeObjectURL(url);
+    ok(status, `已载入 ${img.naturalWidth} × ${img.naturalHeight}px，请在预览中点选水平参照线两端。`);
+  };
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    resetHorizon();
+    fail(status, "无法解码该图片，请确认是有效的 PNG。");
+  };
+  img.src = url;
+});
+
+function resetHorizon() {
+  horizon.file = null;
+  horizon.img = null;
+  horizon.points = [];
+  horizon.result = null;
+  $("#horizon-pick").classList.add("hidden");
+  $("#horizon-result").classList.add("hidden");
+  $("#horizon-angle-preview").textContent = "";
+  $("#horizon-preview").removeAttribute("src");
+  $("#btn-horizon").disabled = true;
+  updateHorizonHint();
+}
+
+function updateHorizonHint() {
+  const hint = $("#horizon-pick-hint");
+  const n = horizon.points.length;
+  hint.textContent = n === 0
+    ? "第 1 次点击：参照线端点 A"
+    : n === 1
+      ? "第 2 次点击：同一参照线端点 B"
+      : "已选 2 点，可执行校正（再次点击将重新选点）";
+}
+
+function drawHorizonCanvas() {
+  const canvas = $("#horizon-canvas");
+  const img = horizon.img;
+  if (!img) return;
+  // 画布内部分辨率 = 原图像素（上限 1600px 宽，等比缩放），坐标映射按比例换算
+  const scale = Math.min(1, 1600 / img.naturalWidth);
+  canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+  const k = canvas.width / img.naturalWidth;   // 原图像素 -> 画布像素
+  const pts = horizon.points;
+  if (pts.length) {
+    ctx.lineWidth = Math.max(1.5, canvas.width / 400);
+    ctx.strokeStyle = "#35d0a3";
+    ctx.fillStyle = "#35d0a3";
+    if (pts.length === 2) {
+      // 参照线（向两端延长到画布边缘，便于观察是否贴合参照物）
+      const [a, b] = pts;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const ext = Math.max(canvas.width, canvas.height) * 2;
+      ctx.beginPath();
+      ctx.moveTo(a.x * k - (dx / len) * ext, a.y * k - (dy / len) * ext);
+      ctx.lineTo(b.x * k + (dx / len) * ext, b.y * k + (dy / len) * ext);
+      ctx.stroke();
+    }
+    pts.forEach((p, i) => {
+      const cx = p.x * k, cy = p.y * k;
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(4, canvas.width / 160), 0, Math.PI * 2);
+      ctx.fillStyle = i === 0 ? "#4f8cff" : "#f0aa28";
+      ctx.fill();
+      ctx.strokeStyle = "#0e1118";
+      ctx.stroke();
+      ctx.fillStyle = "#fff";
+      ctx.font = `${Math.max(11, canvas.width / 60)}px sans-serif`;
+      ctx.fillText(i === 0 ? "A" : "B", cx + 8, cy - 8);
+      ctx.fillStyle = "#35d0a3";
+    });
+  }
+}
+
+$("#horizon-canvas").addEventListener("click", (e) => {
+  if (!horizon.img) return;
+  const canvas = e.target;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  // 显示坐标 -> 原图像素坐标（按画布实际显示比例换算）
+  const x = (e.clientX - rect.left) * (canvas.width / rect.width)
+          * (horizon.img.naturalWidth / canvas.width);
+  const y = (e.clientY - rect.top) * (canvas.height / rect.height)
+          * (horizon.img.naturalHeight / canvas.height);
+  const px = Math.round(x * 100) / 100;
+  const py = Math.round(y * 100) / 100;
+  if (horizon.points.length >= 2) horizon.points = [];   // 第三次点击：重新选点
+  horizon.points.push({ x: px, y: py });
+  // 选点变化后，旧的校正结果即失效
+  horizon.result = null;
+  $("#horizon-result").classList.add("hidden");
+  drawHorizonCanvas();
+  updateHorizonHint();
+
+  const preview = $("#horizon-angle-preview");
+  if (horizon.points.length === 2) {
+    const [a, b] = horizon.points;
+    if (Math.hypot(b.x - a.x, b.y - a.y) < 1) {
+      preview.textContent = "⚠ 两点重合或间距不足 1px，无法确定方向，请重新点选。";
+      $("#btn-horizon").disabled = true;
+      return;
+    }
+    const deg = horizonAngle(a, b);
+    preview.textContent =
+      `参照线 A(${a.x}, ${a.y}) → B(${b.x}, ${b.y}) · 预计校正旋转 ${deg.toFixed(2)}°` +
+      `（${deg > 0 ? "逆时针" : deg < 0 ? "顺时针" : "无需旋转"}）`;
+    $("#btn-horizon").disabled = false;
+  } else {
+    preview.textContent = "";
+    $("#btn-horizon").disabled = true;
+  }
+});
+
+function horizonAngle(a, b) {
+  // 与服务端一致：atan2(dy, dx)（图像坐标 y 向下），归一化到 (-90, 90]
+  let deg = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+  if (deg > 90) deg -= 180;
+  else if (deg <= -90) deg += 180;
+  return deg;
+}
+
+$("#btn-horizon-clear").addEventListener("click", () => {
+  horizon.points = [];
+  horizon.result = null;
+  $("#horizon-result").classList.add("hidden");
+  $("#horizon-angle-preview").textContent = "";
+  $("#btn-horizon").disabled = true;
+  drawHorizonCanvas();
+  updateHorizonHint();
+});
+
+$("#btn-horizon").addEventListener("click", async () => {
+  const status = $("#horizon-status");
+  if (!horizon.file) return fail(status, "请先选择一张 PNG 图片。");
+  if (horizon.points.length !== 2) {
+    return fail(status, "请在预览中沿同一水平参照线点选两个端点。");
+  }
+  const [a, b] = horizon.points;
+  if (Math.hypot(b.x - a.x, b.y - a.y) < 1) {
+    return fail(status, "两点重合或间距不足 1px，请重新点选。");
+  }
+  const fd = new FormData();
+  fd.append("image", horizon.file);
+  fd.append("x1", a.x); fd.append("y1", a.y);
+  fd.append("x2", b.x); fd.append("y2", b.y);
+  busy(status, "正在求反向旋转角、旋转并计算最大无填充居中裁剪区…");
+  $("#horizon-result").classList.add("hidden");
+  try {
+    const r = await api("/api/horizon-correct", { method: "POST", body: fd });
+    horizon.result = r;
+    renderHorizonResult(r);
+    ok(status, "校正完成：裁剪区不含旋转填充空白，可下载或送入 ① 嵌入表单。");
+  } catch (err) {
+    horizon.result = null;
+    fail(status, err.message);
+  }
+});
+
+function renderHorizonResult(r) {
+  $("#horizon-result").classList.remove("hidden");
+  const c = r.crop || {};
+  $("#hz-verdict").textContent =
+    `✔ 已按参照线校正：旋转 ${r.rotate_deg}°，裁剪 ${c.width}×${c.height}px（不含旋转填充）`;
+  $("#hz-size").textContent = `${r.source_size.width} × ${r.source_size.height}px`;
+  $("#hz-tilt").textContent = `${r.line_tilt_deg}°`;
+  $("#hz-angle").textContent =
+    `${r.rotate_deg}°（${r.rotate_deg > 0 ? "逆时针" : r.rotate_deg < 0 ? "顺时针" : "无需旋转"}）`;
+  $("#hz-crop").textContent =
+    `起点 (${c.left}, ${c.top}) · 宽 ${c.width} × 高 ${c.height}` +
+    `（至 (${c.right}, ${c.bottom})，旋转后画布坐标）`;
+  $("#hz-out").textContent =
+    `${r.corrected_size.width} × ${r.corrected_size.height}px · ${r.mode}` +
+    (r.has_alpha ? "（含透明通道）" : "");
+  $("#hz-fill").textContent = `${r.rotation_fill}（已随裁剪完全去除）`;
+  const rc = r.recheck || {};
+  $("#hz-recheck").innerHTML = rc.passed
+    ? `<span class="pe-ok-text">✔ 哨兵覆盖自检通过：裁剪区 ${rc.crop_pixels} 像素全部被原图矩形覆盖，未覆盖 ${rc.uncovered_pixels} px</span>`
+    : `<span class="pe-bad-text">✘ 未通过</span>`;
+  $("#hz-sha").innerHTML = `<small>${escapeHtml(r.download.sha256)}</small>`;
+  $("#horizon-preview").src = r.download.data_url;
+}
+
+$("#btn-horizon-download").addEventListener("click", () => {
+  const r = horizon.result;
+  if (!r || !r.download) return;
+  // data URL -> Blob 下载（与隐私副本导出同一模式）
+  fetch(r.download.data_url)
+    .then((resp) => resp.blob())
+    .then((blob) => {
+      const url = URL.createObjectURL(blob);
+      const aEl = document.createElement("a");
+      const base = (r.filename || "horizon.png").replace(/\.[a-z0-9]+$/i, "") || "horizon";
+      aEl.href = url;
+      aEl.download = `${base}.horizon.png`;
+      document.body.appendChild(aEl);
+      aEl.click();
+      aEl.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    });
+});
+
+$("#btn-horizon-to-embed").addEventListener("click", async () => {
+  const r = horizon.result;
+  const status = $("#horizon-status");
+  if (!r || !r.download) return fail(status, "请先完成一次校正。");
+  try {
+    const blob = await (await fetch(r.download.data_url)).blob();
+    const base = (r.filename || "horizon.png").replace(/\.[a-z0-9]+$/i, "") || "horizon";
+    const file = new File([blob], `${base}.horizon.png`, { type: "image/png" });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    const input = $("#embed-file");
+    input.files = dt.files;
+    input.dispatchEvent(new Event("change"));
+    ok(status, "校正结果已送入 ① 嵌入表单的图片输入，可直接填写水印文本并嵌入。");
+    $("#panel-embed").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (err) {
+    fail(status, "送入嵌入表单失败：" + err.message);
+  }
+});
+
 /* ---------------- UI 辅助 ---------------- */
 
 function resetMatrixPanel() {
