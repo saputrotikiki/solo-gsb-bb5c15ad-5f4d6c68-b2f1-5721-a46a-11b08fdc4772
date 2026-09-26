@@ -33,7 +33,8 @@ docker compose up -d --build
   健康检查 `GET http://localhost:8000/api/health`、
   隐私检查 `POST http://localhost:8000/api/privacy-check`、
   导出隐私副本 `POST http://localhost:8000/api/privacy-export`、
-  PNG 结构审计 `POST http://localhost:8000/api/png-audit`
+  PNG 结构审计 `POST http://localhost:8000/api/png-audit`、
+  水平线校正 `POST http://localhost:8000/api/leveling`
   （Web 与 API **同一端口 8000**，无额外端口或容器；端口可在
   `docker-compose.yml` 的 `ports` 中改为如 `"8080:8000"`）
 - 启动入口：镜像 `CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0",
@@ -98,6 +99,38 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
    - 「失真标注图」用颜色标出健康/受损瓦片、判决错误块、可疑弱块，可**下载 PNG**。
 
 此外，「独立检测」区支持直接上传任意图片（含水印图、JPEG 转发件、截图等）进行盲检测。
+
+### 图片水平线校正（嵌入前可选预处理）
+
+照片中的地平线 / 房檐 / 桌面边缘倾斜时，可在①嵌入面板下方的「**⇱ 图片水平线校正**」
+面板先做几何校正，再送入水印嵌入。入口：首页 **http://localhost:8000**
+→ 左栏「⇱ 图片水平线校正」。
+
+1. 上传一张 **PNG**（复用全站限制：≤ 16MB、最长边 ≤ 4096px）；
+2. 在预览图上**依次点选同一条水平参照线的两端**（例如地平线的左右两端），
+   页面以原图像素坐标显示两点与连线；点错可「清除选点」或第三次点击重新开始；
+3. 服务端按两点坐标计算参照线相对水平线的倾斜角并**反向旋转**整图（角度归一化到
+   (−90°, 90°]，先点哪一端不影响结果）；旋转画布扩展为完整外接矩形后，再根据
+   **原图矩形边界**求一张**最大居中、轴对齐且不含旋转填充空白**的裁剪矩形
+   （面积最大优先；同面积取高度更大者），并返回**角度、裁剪范围**（旋转画布坐标系下的
+   `[left, top, right, bottom)` 半开区间与宽高）与**可下载 PNG**；
+4. 页面可直接预览 / 下载校正 PNG，点击「**送入①水印嵌入表单**」即把结果放入①嵌入
+   面板的图片输入（最短边 ≥ 128px 时满足嵌入要求，页面会明确提示），之后正常输入
+   水印文本即可嵌入。
+
+明确拒绝的输入（HTTP 400 + 中文原因，不返回任何结果图）：
+
+- **两点重合**（间距 < 1px，无法确定稳定方向）；
+- **任一点超出图像范围**（坐标以左上角为原点，x∈[0, 宽−1]，y∈[0, 高−1]）；
+- 非 PNG / 无法解码的文件；超过 16MB 返回 **413**。
+
+**原图自身的透明像素不视为填充空白**：裁剪范围由「像素是否来自原图矩形」的同步
+旋转覆盖掩膜决定，与透明通道无关——原图中央本来就透明的区域不会迫使裁剪区缩小，
+且校正 PNG 原样保留透明通道（RGBA → RGBA）。全程在服务端内存中完成，**上传字节与
+结果均不落盘、不创建水印任务、不改 `meta.json` 与归档**。
+
+对应接口：`POST /api/leveling`（multipart：`image`（PNG）、`p1x`/`p1y`/`p2x`/`p2y`
+原图像素坐标）。
 
 ### 鲁棒性矩阵评测（只读批量，不改写任务）
 
@@ -430,6 +463,7 @@ PNG 规范严格解析：
 | POST | `/api/privacy-check` | multipart：上传 PNG/JPEG `image`，**只读**解析 EXIF 拍摄时间、相机品牌/型号、GPS（带符号十进制度）；不落盘、不建任务，字段缺失为 `null`，EXIF 损坏返回 200 + `warnings` |
 | POST | `/api/privacy-export` | 导出隐私副本（multipart：PNG/JPEG `image`，≤16MB）：先按 EXIF Orientation（1–8）摆正像素，保留透明通道，再以全新 PNG 重编码（无 EXIF/GPS/XMP/ICC/PNG 文本）；**导出前重新解析生成文件做 chunk 扫描 + 再解析 + 像素无损复查**，通过返回 200、原图识别字段（拍摄时间/相机/GPS/方向）与 `recheck` 结果及内联 `download.data_url`，复查不过返回 **500 + `offenders`/`recheck` 且无下载数据**；摆正后超 4096px / 非 PNG·JPEG / 无法解码为 400，超 16MB 为 413；全程内存、不建任务 |
 | POST | `/api/png-audit` | PNG 结构审计（**只读**，multipart：PNG `image`，≤16MB）：按 签名→长度→类型→数据→CRC 逐块解析至 IEND，返回逐块 `chunks`（类型 / 字节范围 / 数据长度 / `crc_valid`）、IEND 之后附加字节的 `trailing`（长度 / 偏移 / SHA-256 / 预览，无尾随时 `length=0`）、`errors`（截断 / 越界长度 / 缺少·重复 IEND / CRC 错误等，含偏移与中文结论）与 `decodable`（能解码 ≠ 结构完整）；结构问题返回 200 + `structurally_valid=false`，非 PNG / 空文件 400，超 16MB 413；全程内存、不落盘、不建任务 |
+| POST | `/api/leveling` | 图片水平线校正（**全内存**，multipart：PNG `image` ≤16MB、最长边 ≤4096px，`p1x`/`p1y`/`p2x`/`p2y` 为同一条水平参照线两端的原图像素坐标）：按两点求反向旋转角（归一化到 (−90°, 90°]，点选顺序无关）旋转整图，再按原图矩形边界求**最大居中、轴对齐且不含旋转填充空白**的裁剪区（原图自身透明像素不视为填充空白），返回 `angle_deg`、`crop`（旋转画布坐标 `[left, top, right, bottom)` + 宽高）与内联 `download.data_url` 可下载 PNG（保留透明通道）；两点重合（间距 <1px）/ 越界 / 非 PNG / 无法解码返回 400，超 16MB 返回 413，缺字段 422；不落盘、不建任务，结果可直接作为 `/api/embed` 的 `image` 输入 |
 | POST | `/api/jobs/{id}/locate` | 传播副本来源定位（**只读**，multipart：`image`）：以任务 `watermarked.png` 为参照，SIFT 特征匹配 + Lowe 比率 + RANSAC 单应估计上传图四角在参照图中的位置；内点数量 / 比例、投影四边形凸性 / 面积 / 边界、重投影误差全部通过时返回 `located=true`、`quad` 四角坐标、`coverage` 覆盖率与内联 JPEG `preview_data_url`；否则 **200 + `located=false`** 与 `reason` / `failed_check`，不返回伪位置。不写任务文件、不产生检测记录与归档；任务不存在 / upload_only 轻量任务返回 404 |
 | GET | `/api/jobs/{id}/{kind}` | 下载 `original` / `watermarked` / `target` / `marked` PNG |
 | GET | `/api/jobs/{id}/detections/{det_id}/{kind}` | 下载某次检测的 `source`（检测输入快照）/ `marked`（标注图）PNG |
@@ -746,6 +780,32 @@ PNG 结构审计响应（节选；该文件结构完整但 IEND 之后有 24 字
 > `decodable` 单独标注该文件能否被常规解码器打开——**能解码不等于结构完整**。
 > 没有尾随内容时 `trailing.length=0`、`sha256=null`，页面明确显示「0 字节」。
 
+水平线校正响应（节选；`crop` 为旋转画布坐标系下的半开区间）：
+
+```json
+{
+  "filename": "horizon.png",
+  "width": 320, "height": 240,
+  "mode": "RGB", "has_alpha": false,
+  "p1": { "x": 40.0, "y": 108.5 }, "p2": { "x": 280.0, "y": 133.8 },
+  "angle_deg": 7.0,
+  "angle_direction": "逆时针校正（参照线右端偏低）",
+  "rotated_size": { "width": 346, "height": 276 },
+  "crop": { "left": 25, "top": 36, "right": 323, "bottom": 242,
+            "width": 298, "height": 206 },
+  "fits_watermark_input": true,
+  "download": { "media_type": "image/png", "bytes": 129135,
+                "sha256": "3a9f…",
+                "data_url": "data:image/png;base64,iVBORw0KGgo…" },
+  "stored": false
+}
+```
+
+> `angle_deg` 为 Pillow `Image.rotate` 语义下的校正角（逆时针为正，归一化到
+> (−90°, 90°]）：数值上等于屏幕坐标（y 向下）中参照线相对水平线的倾斜角，
+> 按该角度反向旋转后参照线水平；两点重合 / 越界 / 非 PNG 返回 **400** 并给出
+> 中文原因，超 16MB 返回 **413**。
+
 ---
 
 ## 五、配置项（环境变量）
@@ -785,10 +845,11 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 │   ├── exifcheck.py      # 图片隐私检查：只读解析 EXIF 拍摄时间 / 相机 / GPS（损坏不阻断、不落盘）
 │   ├── privacy_export.py # 导出隐私副本：EXIF Orientation 摆正像素 / 保留透明通道全新 PNG 重编码 / 导出前重新解析复查（全内存、不建任务）
 │   ├── pngaudit.py       # PNG 结构审计：签名→长度→类型→数据→CRC 逐块解析至 IEND / 尾随字节长度+SHA-256 / 截断·越界·缺少·重复 IEND·CRC 错误定位（只读、全内存）
+│   ├── leveling.py       # 图片水平线校正：两点选线求反向旋转角 / 覆盖掩膜界定填充空白（原图透明像素不算）/ 最大居中无空白裁剪 / 可下载 PNG（全内存、不建任务）
 │   ├── archive.py        # 检测报告：规范化 JSON / SHA-256 清单 / 仅追加哈希链归档 / 校验
-│   ├── main.py           # FastAPI：任务存储、手动/自动嵌入、攻击/检测/鲁棒性矩阵/来源定位/隐私检查/隐私副本导出/PNG 结构审计/报告接口、静态资源
+│   ├── main.py           # FastAPI：任务存储、手动/自动嵌入、攻击/检测/鲁棒性矩阵/来源定位/隐私检查/隐私副本导出/PNG 结构审计/水平线校正/报告接口、静态资源
 │   └── static/
-│       ├── index.html    # 单页界面（嵌入含手动/自动选强度 / 攻击 / 鲁棒性矩阵 / 来源定位 / 检测 / 隐私检查与隐私副本导出 / PNG 结构审计 / 归档）
+│       ├── index.html    # 单页界面（嵌入含手动/自动选强度 / 水平线校正 / 攻击 / 鲁棒性矩阵 / 来源定位 / 检测 / 隐私检查与隐私副本导出 / PNG 结构审计 / 归档）
 │       ├── style.css
 │       └── app.js
 ├── tests/
@@ -800,6 +861,7 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 │   ├── test_privacy.py   # 隐私检查接口：EXIF 解析 / DMS 还原 / 缺失与损坏 / 不落盘不阻断
 │   ├── test_privacy_export.py # 隐私副本导出：8 方向摆正 / 元数据清除 / 透明通道 / 复查与拒绝下载 / 不落盘不建任务
 │   ├── test_png_audit.py # PNG 结构审计：逐块字段与 CRC / 尾随字节 SHA-256 / 重复 IEND / 截断·越界·缺 IEND / 只读不落盘
+│   ├── test_leveling.py  # 水平线校正：角度符号与归一化 / 裁剪最大性暴力验证 / 无填充保证 / 透明像素不算填充 / 拒绝路径 / 结果直送嵌入接口
 │   └── test_reports.py   # 报告归档接口与清单/哈希链校验（篡改、缺失、断链）
 ├── requirements.txt
 ├── Dockerfile
@@ -811,7 +873,7 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 
 ```bash
 python3 tests/test_core.py
-python3 -m pytest tests/ -q   # 归档 + 隐私检查 + 隐私副本导出 + PNG 结构审计 + 方向检索接口测试
+python3 -m pytest tests/ -q   # 归档 + 隐私检查 + 隐私副本导出 + PNG 结构审计 + 方向检索 + 水平线校正接口测试
 ```
 
 数据目录布局（`WM_DATA_DIR`）：
@@ -848,4 +910,7 @@ archive.log.jsonl                     # 仅追加归档记录（哈希链）
 - **PNG 结构审计同样为纯只读操作**：上传字节只在内存中按块解析，不落盘、不建任务、
   不影响隐私导出与归档；审计结论区分「能解码」与「结构完整」，
   发现 IEND 后尾随内容时只报告其长度 / 偏移 / SHA-256，不执行、不展开其中任何数据。
+- **图片水平线校正同样为纯内存操作**：上传 PNG 与校正结果都不落盘、不建任务、
+  不改写任何归档；裁剪范围只由「像素是否来自原图矩形」决定，原图自身透明像素
+  不会被当成旋转填充空白；两点重合或越界时明确拒绝，不返回推测性结果。
 - 数字水印的鲁棒性是概率性的，标注图与置信度用于辅助判断，不构成版权存证保证。

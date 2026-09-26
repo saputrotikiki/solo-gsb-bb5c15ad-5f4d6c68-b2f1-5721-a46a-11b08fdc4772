@@ -241,6 +241,219 @@ $("#btn-download-wm").addEventListener("click", () => {
   if (state.jobId) window.open(`/api/jobs/${state.jobId}/watermarked`, "_blank");
 });
 
+/* ---------------- 图片水平线校正（两点选线，全内存不落盘） ---------------- */
+
+const levelState = {
+  file: null,        // 待校正 PNG
+  points: [],        // [{x, y}] 原图像素坐标（最多 2 个）
+  result: null,      // 最近一次 /api/leveling 响应
+};
+
+function levelEls() {
+  return {
+    stage: $("#level-stage"),
+    img: $("#level-img"),
+    line: $("#level-line"),
+    lineShape: $("#level-line-shape"),
+    dots: [$("#level-p1"), $("#level-p2")],
+    hint: $("#level-pick-hint"),
+    resetBtn: $("#btn-level-reset-points"),
+    runBtn: $("#btn-level"),
+    status: $("#level-status"),
+    result: $("#level-result"),
+  };
+}
+
+function resetLevelPoints() {
+  const el = levelEls();
+  levelState.points = [];
+  levelState.result = null;
+  el.result.classList.add("hidden");
+  renderLevelPoints();
+}
+
+$("#level-file").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  const el = levelEls();
+  resetLevelPoints();
+  el.status.className = "status";
+  el.status.textContent = "";
+  if (!f) {
+    el.stage.classList.add("hidden");
+    el.img.removeAttribute("src");
+    el.hint.textContent = "请先选择 PNG 图片。";
+    levelState.file = null;
+    return;
+  }
+  if (!/^image\/png$/i.test(f.type) && !/\.png$/i.test(f.name)) {
+    levelState.file = null;
+    el.stage.classList.add("hidden");
+    el.img.removeAttribute("src");
+    el.hint.textContent = "请先选择 PNG 图片。";
+    return fail(el.status, "水平线校正仅支持 PNG 图片。");
+  }
+  levelState.file = f;
+  el.img.src = URL.createObjectURL(f);
+  el.stage.classList.remove("hidden");
+  el.hint.textContent = "在预览图上点击第 1 个参照点（水平参照线的一端）。";
+  ok(el.status, `已载入 ${f.name}，请在预览上点选同一条水平参照线的两端。`);
+});
+
+$("#level-img").addEventListener("click", (e) => {
+  const el = levelEls();
+  const img = el.img;
+  if (!levelState.file || !img.naturalWidth) return;
+  const rect = img.getBoundingClientRect();
+  const fx = (e.clientX - rect.left) / rect.width;
+  const fy = (e.clientY - rect.top) / rect.height;
+  if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return;
+  // CSS 像素 -> 原图像素坐标（像素中心为整数 + 0.5），钳制到图像范围内
+  const x = Math.min(img.naturalWidth - 1,
+                     Math.max(0, fx * img.naturalWidth - 0.5));
+  const y = Math.min(img.naturalHeight - 1,
+                     Math.max(0, fy * img.naturalHeight - 0.5));
+  if (levelState.points.length >= 2) levelState.points = [];  // 第三次点击重新选
+  levelState.points.push({ x, y });
+  renderLevelPoints();
+});
+
+function renderLevelPoints() {
+  const el = levelEls();
+  const img = el.img;
+  const pts = levelState.points;
+  el.dots.forEach((d, i) => {
+    if (pts[i] && img.naturalWidth) {
+      d.classList.remove("hidden");
+      d.style.left = `${((pts[i].x + 0.5) / img.naturalWidth) * 100}%`;
+      d.style.top = `${((pts[i].y + 0.5) / img.naturalHeight) * 100}%`;
+    } else {
+      d.classList.add("hidden");
+    }
+  });
+  if (pts.length === 2 && img.naturalWidth) {
+    el.line.setAttribute("viewBox",
+                         `0 0 ${img.naturalWidth} ${img.naturalHeight}`);
+    el.lineShape.setAttribute("x1", pts[0].x + 0.5);
+    el.lineShape.setAttribute("y1", pts[0].y + 0.5);
+    el.lineShape.setAttribute("x2", pts[1].x + 0.5);
+    el.lineShape.setAttribute("y2", pts[1].y + 0.5);
+    el.lineShape.style.display = "";
+  } else {
+    el.lineShape.style.display = "none";
+  }
+  el.resetBtn.disabled = pts.length === 0;
+  el.runBtn.disabled = pts.length !== 2;
+  if (!levelState.file) {
+    el.hint.textContent = "请先选择 PNG 图片。";
+  } else if (pts.length === 0) {
+    el.hint.textContent = "在预览图上点击第 1 个参照点（水平参照线的一端）。";
+  } else if (pts.length === 1) {
+    el.hint.textContent =
+      `第 1 点 (${pts[0].x.toFixed(1)}, ${pts[0].y.toFixed(1)})，请点击参照线的另一端。`;
+  } else {
+    const dx = pts[1].x - pts[0].x;
+    const dy = pts[1].y - pts[0].y;
+    el.hint.textContent =
+      `两点已选：Δx = ${dx.toFixed(1)}px，Δy = ${dy.toFixed(1)}px；` +
+      "在图上再次点击可重新选点。";
+  }
+}
+
+$("#btn-level-reset-points").addEventListener("click", () => resetLevelPoints());
+
+$("#btn-level").addEventListener("click", async () => {
+  const el = levelEls();
+  if (!levelState.file) return fail(el.status, "请先选择 PNG 图片。");
+  if (levelState.points.length !== 2) {
+    return fail(el.status, "请先在预览图上点选参照线的两端。");
+  }
+  const [a, b] = levelState.points;
+  const fd = new FormData();
+  fd.append("image", levelState.file);
+  fd.append("p1x", a.x.toFixed(3));
+  fd.append("p1y", a.y.toFixed(3));
+  fd.append("p2x", b.x.toFixed(3));
+  fd.append("p2y", b.y.toFixed(3));
+  busy(el.status, "正在计算反向旋转角、旋转并求最大居中无填充空白裁剪区…");
+  try {
+    const r = await api("/api/leveling", { method: "POST", body: fd });
+    levelState.result = r;
+    renderLevelResult(r);
+    ok(el.status, "校正完成（全程内存处理，未保存图片、未创建任务）。");
+  } catch (err) {
+    levelState.result = null;
+    el.result.classList.add("hidden");
+    fail(el.status, err.message);
+  }
+});
+
+function renderLevelResult(r) {
+  $("#level-result").classList.remove("hidden");
+  const v = $("#level-verdict");
+  v.className = "pe-verdict ok";
+  v.textContent = `✔ 校正完成：${r.angle_direction}；裁剪区居中且不含旋转填充空白`;
+  $("#lv-angle").textContent = `${r.angle_deg}°（${r.angle_direction}）`;
+  $("#lv-points").textContent =
+    `P1 (${r.p1.x}, ${r.p1.y}) · P2 (${r.p2.x}, ${r.p2.y})`;
+  $("#lv-rot-size").textContent =
+    `${r.rotated_size.width} × ${r.rotated_size.height}px`;
+  const c = r.crop;
+  $("#lv-crop").textContent = `[${c.left}, ${c.top}, ${c.right}, ${c.bottom})`;
+  $("#lv-crop-size").textContent = `${c.width} × ${c.height}px`;
+  $("#lv-alpha").textContent = r.has_alpha
+    ? `已保留（模式 ${r.mode}，原图自身透明像素未视为填充空白）`
+    : `原图无透明通道（${r.mode}）`;
+  $("#lv-sha").innerHTML = `<small>${escapeHtml(r.download.sha256)}</small>`;
+  const img = $("#level-out-preview");
+  img.src = r.download.data_url;
+  img.classList.remove("hidden");
+  $("#lv-fit-hint").textContent = r.fits_watermark_input
+    ? "裁剪结果最短边 ≥ 128px，可直接送入①水印嵌入表单。"
+    : "注意：裁剪结果最短边 < 128px，不满足①水印嵌入的最小尺寸要求。";
+}
+
+function levelDownloadName(r) {
+  const base = (r.filename || "level.png").replace(/\.[a-z0-9]+$/i, "");
+  return (base || "level") + ".leveled.png";
+}
+
+$("#btn-level-download").addEventListener("click", () => {
+  const r = levelState.result;
+  if (!r) return;
+  // data URL -> Blob 下载（与隐私副本导出同一方式）
+  fetch(r.download.data_url)
+    .then((resp) => resp.blob())
+    .then((blob) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = levelDownloadName(r);
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    });
+});
+
+$("#btn-level-to-embed").addEventListener("click", async () => {
+  const r = levelState.result;
+  const status = $("#level-status");
+  if (!r) return fail(status, "请先完成一次水平线校正。");
+  try {
+    const blob = await (await fetch(r.download.data_url)).blob();
+    const file = new File([blob], levelDownloadName(r), { type: "image/png" });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    const input = $("#embed-file");
+    input.files = dt.files;
+    input.dispatchEvent(new Event("change"));
+    ok(status, "校正结果已送入①嵌入水印表单，请继续输入水印文本并嵌入。");
+    $("#panel-embed").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (err) {
+    fail(status, "送入嵌入表单失败：" + err.message);
+  }
+});
+
 /* ---------------- 攻击 ---------------- */
 
 $("#jpeg-q").addEventListener("input", (e) => $("#jpeg-val").textContent = e.target.value);

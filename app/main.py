@@ -30,6 +30,11 @@
                           并报告 IEND 之后附加字节长度与 SHA-256；截断、越界长度、
                           缺少/重复 IEND、CRC 错误均给出偏移与明确结论，能解码不等于
                           结构完整。全程内存，不落盘、不建任务、不影响隐私导出
+  POST /api/leveling      图片水平线校正（全内存）：上传 PNG + 同一条水平参照线
+                          两端点（原图像素坐标），按反向旋转角校正后求最大居中、
+                          轴对齐且不含旋转填充空白的裁剪区（原图自身透明像素不视为
+                          填充空白），返回角度、裁剪范围与可下载 PNG；两点重合或
+                          超出图像范围明确拒绝。不落盘、不建任务
   GET  /api/jobs/{id}/{kind}  任务文件下载（original/watermarked/target/marked）
   GET  /api/jobs/{id}/detections/{det_id}/{kind}  某次检测的输入快照 / 标注图
   POST /api/jobs/{id}/reports   选择一次或多次检测 -> 可验证 JSON 报告并追加归档
@@ -40,6 +45,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
@@ -53,7 +59,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from . import archive, autostrength, dctwm as wm
-from . import exifcheck, matrix, orientation, pngaudit, privacy_export, provenance
+from . import exifcheck, leveling, matrix, orientation, pngaudit, privacy_export, provenance
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -673,6 +679,49 @@ async def png_audit(image: UploadFile = File(...)):
         **result,
         "stored": False,
     })
+
+
+@app.post("/api/leveling")
+async def level_image(
+    image: UploadFile = File(...),
+    p1x: str = Form(...),
+    p1y: str = Form(...),
+    p2x: str = Form(...),
+    p2y: str = Form(...),
+):
+    """图片水平线校正（全内存、不建任务、不落盘）。
+
+    用户上传 PNG 并点选同一条水平参照线的两端（原图像素坐标，左上角
+    原点）；服务端求反向旋转角，旋转后根据原图矩形边界求**最大居中、
+    轴对齐且不含旋转填充空白**的裁剪区（原图自身透明像素不视为填充
+    空白），返回角度、裁剪范围与内联可下载 PNG。两点重合（间距 < 1px）
+    或超出图像范围时返回 400 并给出明确中文原因；非 PNG / 无法解码
+    返回 400，超过 16MB 返回 413。
+    """
+    data = await image.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="图片不能超过 16MB。")
+    if not data:
+        raise HTTPException(status_code=400, detail="上传内容为空。")
+
+    def _coord(name: str, value: str) -> float:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400,
+                                detail=f"{name} 必须是数值。")
+        if not math.isfinite(v):
+            raise HTTPException(status_code=400,
+                                detail=f"{name} 必须是有限数值。")
+        return v
+
+    p1 = (_coord("p1x", p1x), _coord("p1y", p1y))
+    p2 = (_coord("p2x", p2x), _coord("p2y", p2y))
+    try:
+        result = leveling.straighten_image(data, p1, p2, max_dim=MAX_DIM)
+    except leveling.LevelingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return JSONResponse({"filename": image.filename, **result})
 
 
 @app.get("/api/jobs/{job_id}/{kind}")

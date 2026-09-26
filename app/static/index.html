@@ -103,6 +103,59 @@
       </div>
     </section>
 
+    <section class="panel" id="panel-leveling">
+      <h2><span class="num">⇱</span> 图片水平线校正（可选预处理）</h2>
+      <p class="muted">
+        上传 <b>PNG</b> 后在预览图上点选<b>同一条水平参照线的两端</b>（如地平线、房檐），
+        服务端按<b>反向旋转角</b>校正，再取旋转后<b>最大居中、轴对齐且不含旋转填充空白</b>
+        的裁剪区（原图自身透明像素不算填充空白），返回校正角度、裁剪范围与可下载 PNG；
+        校正结果可<b>直接送入①水印嵌入表单</b>。全程内存，<b>不保存图片、不创建任务</b>。
+      </p>
+      <label class="field">
+        <span>待校正图片（仅 PNG，≤ 16MB，最长边 ≤ 4096px）</span>
+        <input type="file" id="level-file" accept="image/png" />
+      </label>
+
+      <div class="field">
+        <div class="level-stage-wrap">
+          <div class="level-stage hidden" id="level-stage">
+            <img id="level-img" alt="水平参照线选点预览" />
+            <svg id="level-line" class="level-line" viewBox="0 0 1 1" preserveAspectRatio="none">
+              <line id="level-line-shape" x1="0" y1="0" x2="0" y2="0"></line>
+            </svg>
+            <div id="level-p1" class="level-point p1 hidden"></div>
+            <div id="level-p2" class="level-point p2 hidden"></div>
+          </div>
+        </div>
+        <div class="btn-row" style="margin-top:10px;">
+          <button class="primary" id="btn-level-reset-points" disabled>清除选点</button>
+        </div>
+        <small class="muted" id="level-pick-hint">请先选择 PNG 图片。</small>
+      </div>
+
+      <button class="primary" id="btn-level" disabled>按所选参照线校正</button>
+      <div class="status" id="level-status"></div>
+
+      <div id="level-result" class="privacy-box hidden">
+        <div id="level-verdict" class="pe-verdict ok"></div>
+        <dl class="privacy-dl">
+          <dt>校正角度</dt><dd id="lv-angle">—</dd>
+          <dt>原图像素点</dt><dd id="lv-points">—</dd>
+          <dt>旋转画布</dt><dd id="lv-rot-size">—</dd>
+          <dt>裁剪范围 [left,top,right,bottom)</dt><dd id="lv-crop">—</dd>
+          <dt>裁剪后尺寸</dt><dd id="lv-crop-size">—</dd>
+          <dt>透明通道</dt><dd id="lv-alpha">—</dd>
+          <dt>SHA-256</dt><dd id="lv-sha">—</dd>
+        </dl>
+        <img id="level-out-preview" class="level-out hidden" alt="水平线校正裁剪结果预览" />
+        <div class="btn-row" style="margin-top:10px;">
+          <button class="ghost" id="btn-level-download">⬇ 下载校正 PNG</button>
+          <button class="primary subtle" id="btn-level-to-embed">送入①水印嵌入表单</button>
+        </div>
+        <small class="muted" id="lv-fit-hint"></small>
+      </div>
+    </section>
+
     <section class="panel disabled" id="panel-attack">
       <h2><span class="num">②</span> 施加攻击（模拟传播失真）</h2>
 
